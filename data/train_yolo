@@ -1,0 +1,35 @@
+from ultralytics import YOLO
+import os
+
+if __name__ == '__main__':
+    model = YOLO("yolo11s.pt")
+
+    results = model.train(
+        data=r"F:\drone-main\src\data\dataset\yolo\data.yaml",
+        project="Drone_Vision_Core",
+        name="v2_correct_ids",
+
+        epochs=300,
+        patience=30,
+        batch=12,
+        imgsz=640,
+        device="cpu",
+
+        workers=4,
+        amp=True,
+
+        optimizer="AdamW",
+        lr0=0.001,
+        lrf=0.01,
+        weight_decay=0.0005,
+        cos_lr=True,
+
+        degrees=15.0,
+        scale=0.5,
+        perspective=0.0001,
+        fliplr=0.5,
+        mosaic=1.0,
+        mixup=0.15,
+        copy_paste=0.1,
+        close_mosaic=15,
+    )

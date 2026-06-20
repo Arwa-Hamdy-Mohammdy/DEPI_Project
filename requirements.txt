@@ -1,0 +1,6 @@
+airsim
+numpy
+opencv-python
+pyyaml
+torch
+ultralytics

@@ -1,0 +1,9 @@
+names:
+- tree
+- building
+- fence
+- car
+- pole
+nc: 5
+train: F:\drone-main\src\data\dataset\yolo\images\train
+val: F:\drone-main\src\data\dataset\yolo\images\train

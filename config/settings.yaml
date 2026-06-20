@@ -1,0 +1,17 @@
+drone:
+  default_speed: 2.0
+  default_altitude: -5.0
+  movement_duration: 0.2
+
+camera:
+  width: 640
+  height: 480
+  fov: 90
+
+vision:
+  model_path: "models/yolov8n.pt"
+  confidence_threshold: 0.5
+
+runtime:
+  loop_delay_seconds: 0.1
+  max_steps: 100
