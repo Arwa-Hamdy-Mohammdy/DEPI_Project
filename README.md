@@ -248,8 +248,11 @@ Policy Update (PPO)
 
 | Name |
 |------|
-| Arwa Hamdy Mohammdy |
-| Samir Fawzy |
+| Arwa Hamdy      |
+| Samir Fawzy     |
+| Basmala Ayman   |
+| Omar Diaaeldeen |
+| Nour Tamer      |
 
 ---
 
