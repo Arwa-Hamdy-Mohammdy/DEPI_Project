@@ -248,7 +248,29 @@ class DroneController:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._executor, self._get_pose_sync, self.client)
         return {"x": 0.0, "y": 0.0, "z": 0.0}
-
+    
+    async def get_kinematics(self) -> dict:
+        """
+        قراءة الموقع والسرعة الحالية من مستشعرات AirSim
+        وتحويلها من نظام NED (بتاع المحاكي) لنظام ENU (اللي الموديل اتدرب عليه)
+        """
+        import numpy as np
+        import asyncio
+        
+        # استدعاء حالة الدرون من المحاكي في Thread منفصل عشان مايعطلش الـ Async
+        state = await asyncio.to_thread(self.client.getMultirotorState)
+        
+        pos = state.kinematics_estimated.position
+        vel = state.kinematics_estimated.linear_velocity
+        
+        # تحويل المحاور: عكس إشارة محور Z عشان يكون الارتفاع بالموجب (ENU)
+        position = np.array([pos.x_val, pos.y_val, -pos.z_val], dtype=np.float32)
+        velocity = np.array([vel.x_val, vel.y_val, -vel.z_val], dtype=np.float32)
+        
+        return {
+            "position": position,
+            "velocity": velocity
+        }
     # ── NEW: Yaw public API ───────────────────────────────────────────────────
     async def get_yaw(self) -> float:
         """
@@ -274,4 +296,4 @@ class DroneController:
             await loop.run_in_executor(
                 self._executor, self._rotate_yaw_sync, self.client, degrees, duration
             )
-        self.logger.debug("Rotate yaw: %.1f° (duration=%.1fs)", degrees, duration)
+        self.logger.debug("Rotate yaw: %.1f° (duration=%.1fs)", degrees, duration)  
