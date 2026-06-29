@@ -71,20 +71,6 @@ class VisionService:
         120: "light"
     }
 
-    # =========================================================================
-    # PPO Vision-Branch Config — MUST stay numerically identical to the
-    # corresponding constants in DroneCityEnv.py. The policy was trained on
-    # exactly this preprocessing; drifting any of these values here without
-    # updating (or retraining) the policy silently breaks train/inference
-    # parity. Do not make these "configurable" without a very good reason.
-    # =========================================================================
-    PPO_VISION_H: int = 64
-    PPO_VISION_W: int = 64
-    PPO_MAX_DEPTH_M: float = 50.0
-    PPO_BUILDING_SEG_ID: int = 12  # NOTE: this is DroneCityEnv's BUILDING_SEG_ID,
-                                   # distinct from this class's own SEG_CLASS_MAPPING
-                                   # (=50), which only feeds the YOLO-fusion path below.
-
     def __init__(
         self,
         project_root: Path,
@@ -256,82 +242,6 @@ class VisionService:
         """Legacy support: returns only RGB frame."""
         frames = await self.get_frames()
         return frames["rgb"]
-
-    # -------------------------------------------------------------------------
-    # PPO vision branch (depth + building-masked segmentation)
-    # -------------------------------------------------------------------------
-    def _fetch_ppo_vision_sync(self, client, camera_id: str) -> np.ndarray:
-        """Runs on the dedicated AirSim RPC thread. Logic is a line-for-line
-        port of DroneCityEnv._get_depth_vision() — keep them in sync."""
-        import airsim
-
-        responses = client.simGetImages([
-            airsim.ImageRequest(camera_id, airsim.ImageType.DepthPerspective, True, False),
-            airsim.ImageRequest(camera_id, airsim.ImageType.Segmentation, False, False),
-        ])
-        depth_response, seg_response = responses[0], responses[1]
-
-        if depth_response.width == 0 or depth_response.height == 0:
-            self.logger.warning("Empty PPO depth image; returning zeros.")
-            return np.zeros((self.PPO_VISION_H, self.PPO_VISION_W, 1), dtype=np.float32)
-
-        depth_raw = np.array(
-            depth_response.image_data_float, dtype=np.float32
-        ).reshape(depth_response.height, depth_response.width)
-
-        if seg_response.width > 0 and seg_response.height > 0:
-            seg_raw = np.frombuffer(seg_response.image_data_uint8, dtype=np.uint8)
-            seg_raw = seg_raw.reshape(seg_response.height, seg_response.width, -1)
-            seg_channel = seg_raw[:, :, 0]
-
-            if seg_channel.shape != depth_raw.shape:
-                seg_channel = self._resize_nearest(
-                    seg_channel, depth_raw.shape[0], depth_raw.shape[1]
-                )
-
-            building_mask = seg_channel == self.PPO_BUILDING_SEG_ID
-            depth_raw[building_mask] = 0.0
-        else:
-            self.logger.debug("Empty segmentation image; skipping building masking.")
-
-        if depth_raw.shape != (self.PPO_VISION_H, self.PPO_VISION_W):
-            depth_raw = self._resize_nearest(depth_raw, self.PPO_VISION_H, self.PPO_VISION_W)
-
-        depth_norm = np.clip(depth_raw, 0.0, self.PPO_MAX_DEPTH_M) / self.PPO_MAX_DEPTH_M
-        return depth_norm[:, :, np.newaxis].astype(np.float32)
-
-    @staticmethod
-    def _resize_nearest(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-        """Nearest-neighbour resize, identical to DroneCityEnv._resize_depth()."""
-        src_h, src_w = img.shape
-        row_idx = (np.arange(out_h) * src_h / out_h).astype(int)
-        col_idx = (np.arange(out_w) * src_w / out_w).astype(int)
-        return img[np.ix_(row_idx, col_idx)]
-
-    async def get_ppo_vision_obs(self) -> np.ndarray:
-        """
-        Fetch the PPO 'vision' observation: depth image with Building-class
-        pixels masked to 0.0, resized to (64, 64), normalised to [0, 1].
-
-        Returns
-        -------
-        np.ndarray shape (64, 64, 1), dtype float32 — matches
-        DroneCityEnv.observation_space['vision'] exactly. On any AirSim/RPC
-        failure, returns an all-zero frame (treated as "no obstacles
-        visible") rather than raising, so a single dropped frame doesn't
-        crash the control loop.
-        """
-        try:
-            client = await self._get_airsim_client()
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                self._airsim_executor, self._fetch_ppo_vision_sync, client, self.camera_id
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.logger.error("Failed to build PPO vision obs: %s", exc)
-            return np.zeros((self.PPO_VISION_H, self.PPO_VISION_W, 1), dtype=np.float32)
 
     async def detect_objects(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """Offload YOLO to process pool."""
