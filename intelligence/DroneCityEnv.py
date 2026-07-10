@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import airsim
@@ -119,6 +120,7 @@ class DroneCityEnv(gym.Env):
         voxel_grid: Optional[np.ndarray] = None,
         voxel_size: float                = DEFAULT_VOXEL_SIZE,
         max_episode_steps: int           = 2_000,
+        rank: int                        = 0,
     ) -> None:
         super().__init__()
 
@@ -126,14 +128,16 @@ class DroneCityEnv(gym.Env):
         self._start_voxel      = start
         self._goal_voxel       = goal
         self._max_episode_steps = max_episode_steps
+        self.rank              = rank
 
         # ── 2. Connect to AirSim ──────────────────────────────────────────
-        logger.info("Connecting to AirSim …")
+        self.vehicle_name = f"Drone{self.rank}"
+        logger.info("Connecting to AirSim (Vehicle: %s) …", self.vehicle_name)
         self.client = airsim.MultirotorClient()
         self.client.confirmConnection()
-        self.client.enableApiControl(True)
-        self.client.armDisarm(True)
-        logger.info("AirSim connection established.")
+        self.client.enableApiControl(True, vehicle_name=self.vehicle_name)
+        self.client.armDisarm(True, vehicle_name=self.vehicle_name)
+        logger.info("AirSim connection established for %s.", self.vehicle_name)
 
         # ── 3. Build voxel grid and Path Planner ──────────────────────────
         if voxel_grid is None:
@@ -153,6 +157,8 @@ class DroneCityEnv(gym.Env):
         # ── 4. Pre-compute full global path (waypoints in world-space m) ──
         logger.info("Computing global path …")
         self._waypoints: Waypoints = self._planner.plan(start, goal)
+        if self._waypoints and len(self._waypoints) > 1:
+            self._waypoints.pop(0)
         logger.info("Global path: %d waypoints computed.", len(self._waypoints))
 
         # ── 5. Episode-level state (initialised properly in reset()) ───────
@@ -195,6 +201,13 @@ class DroneCityEnv(gym.Env):
                     shape = (DEPTH_IMG_H, DEPTH_IMG_W, 1),
                     dtype = np.float32,
                 ),
+                # center-cropped depth sensor (1,), values in [0, 1] (max 30m)
+                "distance_sensor": spaces.Box(
+                    low   = 0.0,
+                    high  = 1.0,
+                    shape = (1,),
+                    dtype = np.float32,
+                ),
             }
         )
 
@@ -233,18 +246,32 @@ class DroneCityEnv(gym.Env):
 
         logger.debug("Resetting AirSim environment …")
 
+        # Ensure we are not paused during reset API calls and allow it to register safely
+        self.client.simPause(False)
+        time.sleep(0.1)
+
         # -- Safely stop any ongoing motion ----------------------------------
-        self.client.cancelLastTask()
-        self.client.armDisarm(False)
+        self.client.cancelLastTask(vehicle_name=self.vehicle_name)
+        self.client.armDisarm(False, vehicle_name=self.vehicle_name)
 
         # -- Full scene reset -------------------------------------------------
-        self.client.reset()
-        self.client.enableApiControl(True)
-        self.client.armDisarm(True)
+        # self.client.reset()  # DEPRECATED: Causes FMallocBinned2 crashes in UE4
+        
+        # Safe reset: spawn the drone exactly at the start voxel's world coordinate
+        # to match the path planner's starting point.
+        start_world = self._planner._voxel_to_world(self._start_voxel)
+        # start_world is in ENU (x, y, z). AirSim expects NED (x, y, -z)
+        start_pose = airsim.Pose(airsim.Vector3r(start_world[0], start_world[1], -start_world[2]), airsim.to_quaternion(0, 0, 0))
+        self.client.simSetVehiclePose(start_pose, True, vehicle_name=self.vehicle_name)
+        
+        self.client.enableApiControl(True, vehicle_name=self.vehicle_name)
+        self.client.armDisarm(True, vehicle_name=self.vehicle_name)
 
-        # -- Take off to a safe altitude -------------------------------------
-        self.client.takeoffAsync().join()
-        logger.debug("Drone airborne.")
+        # Allow Unreal Engine physics and rendering to stabilize to prevent crashes
+        time.sleep(0.2)
+
+        # We can skip the slow takeoffAsync().join() call entirely since we teleport to air.
+        logger.debug("Drone airborne at start voxel altitude.")
 
         # -- Reset episode bookkeeping ---------------------------------------
         self.current_waypoint_index = 0
@@ -252,13 +279,56 @@ class DroneCityEnv(gym.Env):
         self._episode_done          = False
         self._prev_action           = np.zeros(3, dtype=np.float32)
 
-        # Compute initial distance to first waypoint
-        initial_pos = self._get_position()
-        self._prev_dist_to_wp = self._dist_to_waypoint(
-            initial_pos, self._waypoints[0]
-        )
+        # -- Randomize Goal --------------------------------------------------
+        # Pick a random distance and angle for the new goal to prevent overfitting
+        X, Y, _ = self._planner._shape
+        start_x, start_y, start_z = self._start_voxel
+        
+        for _ in range(100):
+            radius = random.uniform(20.0, 80.0)
+            angle = random.uniform(0.0, 2 * math.pi)
+            goal_x = int(start_x + radius * math.cos(angle))
+            goal_y = int(start_y + radius * math.sin(angle))
+            
+            if 0 <= goal_x < X and 0 <= goal_y < Y:
+                # Spatial validation check to prevent instant termination
+                start_world = self._planner._voxel_to_world((start_x, start_y, start_z))
+                goal_world = self._planner._voxel_to_world((goal_x, goal_y, start_z))
+                dist_m = math.sqrt((goal_world[0] - start_world[0])**2 + (goal_world[1] - start_world[1])**2)
+                
+                if dist_m >= 15.0:
+                    self._goal_voxel = (goal_x, goal_y, start_z)
+                    break
+        else:
+            # Fallback if no valid point is found (ensure minimum 15m distance safely)
+            offset_x = 20 if start_x + 20 < X else -20
+            offset_y = 20 if start_y + 20 < Y else -20
+            self._goal_voxel = (start_x + offset_x, start_y + offset_y, start_z)
 
-        obs  = self._get_obs()
+        logger.info("Randomized goal to %s. Re-planning path...", self._goal_voxel)
+        self._waypoints = self._planner.plan(self._start_voxel, self._goal_voxel)
+        
+        # Fallback if no valid path
+        if not self._waypoints:
+            logger.warning("Planner failed to find path. Falling back to direct line.")
+            self._waypoints = [self._start_voxel, self._goal_voxel]
+        elif len(self._waypoints) > 1:
+            # The first node is always the starting point, remove it
+            self._waypoints.pop(0)
+
+        # Remove simPause(True) here to maintain stability with the time.sleep() approach in step()
+        
+        # Small sleep to throttle RPC calls before fetching state
+        time.sleep(0.05)
+
+        state = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        
+        # Exactly initialize the distance tracking using the actual initial state
+        pos = state.kinematics_estimated.position
+        initial_pos = (pos.x_val, pos.y_val, -pos.z_val)
+        self._prev_dist_to_wp = self._dist_to_waypoint(initial_pos, self._waypoints[0])
+        
+        obs  = self._get_obs(state)
         info = {"waypoint_index": self.current_waypoint_index,
                 "num_waypoints":  len(self._waypoints)}
         return obs, info
@@ -304,18 +374,24 @@ class DroneCityEnv(gym.Env):
             duration = STEP_DURATION_S,
             drivetrain  = airsim.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode    = airsim.YawMode(is_rate=False, yaw_or_rate=0),
-        ).join()
+            vehicle_name=self.vehicle_name,
+        )
 
-        # ── 2. Collect new state ──────────────────────────────────────────
+        # Replaced simContinueForTime with Python's native sleep to avoid RPC dispatcher crashes
+        time.sleep(STEP_DURATION_S)
+
+        # ── 2. Collect new state (Optimised: 1 API call for all kinematics/collisions) 
+        state = self.client.getMultirotorState(vehicle_name=self.vehicle_name)
+        
         self._step_count += 1
-        obs       = self._get_obs()
-        reward, terminated = self._compute_reward(action)
+        obs       = self._get_obs(state)
+        reward, terminated = self._compute_reward(action, state)
         truncated = self._step_count >= self._max_episode_steps
 
         if terminated or truncated:
             self._episode_done = True
             # Hover to avoid physics instability on next reset
-            self.client.hoverAsync()
+            self.client.hoverAsync(vehicle_name=self.vehicle_name)
 
         # Update previous action for smoothness penalty in the next step
         self._prev_action = action.copy()
@@ -344,7 +420,7 @@ class DroneCityEnv(gym.Env):
     # Observation
     # -----------------------------------------------------------------------
 
-    def _get_obs(self) -> Dict[str, np.ndarray]:
+    def _get_obs(self, state: airsim.MultirotorState) -> Dict[str, np.ndarray]:
         """Assemble the observation dict from live AirSim sensor data.
 
         Returns
@@ -353,15 +429,16 @@ class DroneCityEnv(gym.Env):
             ``kinematics``     – shape ``(6,)``  float32
             ``waypoint_vector``– shape ``(3,)``  float32
             ``vision``         – shape ``(H,W,1)`` float32  ∈ [0, 1]
+            ``distance_sensor``– shape ``(1,)``  float32  ∈ [0, 1]
         """
         # ── Kinematics ────────────────────────────────────────────────────
-        state     = self.client.getMultirotorState()
         kin       = state.kinematics_estimated
 
         # Position (NED → ENU: flip y and z)
-        pos_x =  kin.position.x_val
-        pos_y =  kin.position.y_val
-        pos_z = -kin.position.z_val   # NED z is downward; flip to ENU
+        # Horizontal positions zeroed to prevent overfitting, but altitude (pos_z) is kept
+        pos_x =  0.0
+        pos_y =  0.0
+        pos_z = -kin.position.z_val
 
         # Linear velocity (same sign-flip for z)
         vel_x =  kin.linear_velocity.x_val
@@ -373,96 +450,83 @@ class DroneCityEnv(gym.Env):
         )
 
         # ── Waypoint vector ───────────────────────────────────────────────
-        current_pos = (pos_x, pos_y, pos_z)
+        current_pos = (kin.position.x_val, kin.position.y_val, -kin.position.z_val)
         wp          = self._waypoints[self.current_waypoint_index]
         wp_vec      = np.array(
-            [wp[0] - pos_x, wp[1] - pos_y, wp[2] - pos_z], dtype=np.float32
+            [wp[0] - current_pos[0], wp[1] - current_pos[1], wp[2] - current_pos[2]], dtype=np.float32
         )
 
-        # Update distance tracker for reward computation
-        self._prev_dist_to_wp = self._dist_to_waypoint(current_pos, wp)
-
-        # ── Vision (depth + building segmentation) ────────────────────────
-        vision_obs = self._get_depth_vision()
+        # ── Vision and Distance ───────────────────────────────────────────
+        vision_obs, distance_obs = self._get_depth_vision()
 
         return {
             "kinematics":      kinematics_obs,
             "waypoint_vector": wp_vec,
             "vision":          vision_obs,
+            "distance_sensor": distance_obs,
         }
 
-    def _get_depth_vision(self) -> np.ndarray:
-        """Capture and preprocess the depth image with building-class masking.
+    def _get_depth_vision(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Capture and preprocess the depth image and center distance.
 
-        Retrieves both a depth perspective image and a segmentation image from
-        AirSim. Pixels classified as **Building** (segmentation ID
-        ``BUILDING_SEG_ID``) are set to zero depth, emphasising these obstacles
-        in the agent's visual field.
+        We use a single ImageType.DepthPlanar request to drastically reduce 
+        network RPC overhead. DepthPlanar provides the true orthogonal distance 
+        to all objects (including buildings), making it perfect for both the 
+        CNN vision input and the dedicated center distance sensor.
 
         Returns
         -------
-        np.ndarray  shape ``(DEPTH_IMG_H, DEPTH_IMG_W, 1)``  dtype float32.
+        vision_obs: np.ndarray shape ``(DEPTH_IMG_H, DEPTH_IMG_W, 1)``  dtype float32.
             Values are normalised to ``[0, 1]`` where 0 = obstacle / minimum
             depth and 1 = maximum depth (``MAX_DEPTH_M``).
+        distance_obs: np.ndarray shape ``(1,)`` dtype float32.
+            Normalised minimum depth in the center crop [0, 1] where 1 = 30m.
         """
         image_requests = [
             airsim.ImageRequest(
                 camera_name = DEPTH_CAM_NAME,
-                image_type  = airsim.ImageType.DepthPerspective,
+                image_type  = airsim.ImageType.DepthPlanar,
                 pixels_as_float = True,
-                compress        = False,
-            ),
-            airsim.ImageRequest(
-                camera_name = DEPTH_CAM_NAME,
-                image_type  = airsim.ImageType.Segmentation,
-                pixels_as_float = False,
                 compress        = False,
             ),
         ]
 
-        responses = self.client.simGetImages(image_requests)
-
-        # ── Parse depth image ─────────────────────────────────────────────
+        responses = self.client.simGetImages(image_requests, vehicle_name=self.vehicle_name)
         depth_response = responses[0]
+
         if depth_response.width == 0 or depth_response.height == 0:
             logger.warning("Empty depth image received; returning zeros.")
-            return np.zeros((DEPTH_IMG_H, DEPTH_IMG_W, 1), dtype=np.float32)
+            return np.zeros((DEPTH_IMG_H, DEPTH_IMG_W, 1), dtype=np.float32), np.array([1.0], dtype=np.float32)
 
+        # ── Parse depth image ─────────────────────────────────────────────
         depth_raw = np.array(
             depth_response.image_data_float, dtype=np.float32
         ).reshape(depth_response.height, depth_response.width)
 
-# ── Parse segmentation image ──────────────────────────────────────
-        seg_response = responses[1]
-        if seg_response.width > 0 and seg_response.height > 0:
-            seg_raw = np.frombuffer(seg_response.image_data_uint8, dtype=np.uint8)
-            seg_raw = seg_raw.reshape(
-                seg_response.height, seg_response.width, -1
-            )
-            
-            # استخراج القناة الحمراء (اللي فيها الـ ID بتاع المباني)
-            seg_channel = seg_raw[:, :, 0]
-            
-            # --- التعديل هنا: توحيد المقاسات لتطابق صورة العمق ---
-            if seg_channel.shape != depth_raw.shape:
-                seg_channel = self._resize_depth(seg_channel, depth_raw.shape[0], depth_raw.shape[1])
-            
-            # تحديد المباني وتعديل العمق
-            building_mask = seg_channel == BUILDING_SEG_ID
-            depth_raw[building_mask] = 0.0
-        else:
-            logger.debug("Empty segmentation image; skipping building masking.")
-
         # ── Resize to network input size ──────────────────────────────────
-        # Use simple area interpolation via strided slicing if shapes match,
-        # otherwise fall back to nearest-neighbour via index arithmetic.
         if depth_raw.shape != (DEPTH_IMG_H, DEPTH_IMG_W):
             depth_raw = self._resize_depth(depth_raw, DEPTH_IMG_H, DEPTH_IMG_W)
 
-        # ── Clip and normalise to [0, 1] ──────────────────────────────────
+        # ── Center Distance Sensor ────────────────────────────────────────
+        # Extract a small 20% center crop from the raw un-normalized depth
+        ph, pw = depth_raw.shape
+        crop_h = max(1, ph // 5)
+        crop_w = max(1, pw // 5)
+        start_h = (ph - crop_h) // 2
+        start_w = (pw - crop_w) // 2
+        
+        center_crop = depth_raw[start_h : start_h + crop_h, start_w : start_w + crop_w]
+        min_depth = float(np.min(center_crop))
+        
+        # Normalize scalar distance (clip at 30 meters, scale to [0, 1])
+        max_dist_m = 30.0
+        dist_norm_scalar = np.clip(min_depth, 0.0, max_dist_m) / max_dist_m
+        distance_obs = np.array([dist_norm_scalar], dtype=np.float32)
+
+        # ── Clip and normalise vision for CNN [0, 1] ──────────────────────
         depth_norm = np.clip(depth_raw, 0.0, MAX_DEPTH_M) / MAX_DEPTH_M
 
-        return depth_norm[:, :, np.newaxis].astype(np.float32)
+        return depth_norm[:, :, np.newaxis].astype(np.float32), distance_obs
 
     @staticmethod
     def _resize_depth(
@@ -481,6 +545,7 @@ class DroneCityEnv(gym.Env):
     def _compute_reward(
         self,
         action: np.ndarray,
+        state: airsim.MultirotorState,
     ) -> Tuple[float, bool]:
         """Compute the scalar reward for the current step.
 
@@ -514,7 +579,6 @@ class DroneCityEnv(gym.Env):
         reward     = 0.0
 
         # ── Fetch live state ──────────────────────────────────────────────
-        state    = self.client.getMultirotorState()
         kin      = state.kinematics_estimated
         pos_x    =  kin.position.x_val
         pos_y    =  kin.position.y_val
@@ -526,14 +590,13 @@ class DroneCityEnv(gym.Env):
         wp = self._waypoints[self.current_waypoint_index]
 
         # ── 1. Collision check (highest priority) ─────────────────────────
-        collision_info = self.client.simGetCollisionInfo()
-        if collision_info.has_collided:
+        if state.collision.has_collided:
             reward    += COLLISION_REW
             terminated = True
             logger.info(
                 "Collision detected at step %d. object=%s",
                 self._step_count,
-                collision_info.object_name,
+                state.collision.object_name,
             )
             return reward, terminated
 
@@ -595,7 +658,7 @@ class DroneCityEnv(gym.Env):
 
     def _get_position(self) -> Tuple[float, float, float]:
         """Return the current drone position in ENU world-space metres."""
-        kin = self.client.getMultirotorState().kinematics_estimated
+        kin = self.client.getMultirotorState(vehicle_name=self.vehicle_name).kinematics_estimated
         return (
              kin.position.x_val,
              kin.position.y_val,
@@ -631,9 +694,10 @@ class DroneCityEnv(gym.Env):
         """
         logger.info("Closing DroneCityEnv – releasing AirSim control.")
         try:
-            self.client.hoverAsync().join()
-            self.client.armDisarm(False)
-            self.client.enableApiControl(False)
+            self.client.simPause(False)
+            self.client.hoverAsync(vehicle_name=self.vehicle_name).join()
+            self.client.armDisarm(False, vehicle_name=self.vehicle_name)
+            self.client.enableApiControl(False, vehicle_name=self.vehicle_name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Error during graceful shutdown: %s", exc)
 

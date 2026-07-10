@@ -32,6 +32,7 @@ from stable_baselines3.common.callbacks import (
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import NatureCNN
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from intelligence.DroneCityEnv import DroneCityEnv
 
@@ -116,7 +117,7 @@ def build_policy_kwargs() -> dict:
 # Environment factory
 # ---------------------------------------------------------------------------
 
-def make_env(seed: int = SEED) -> Monitor:
+def make_env(rank: int, seed: int = SEED):
     """
     Instantiate and wrap DroneCityEnv for training.
 
@@ -124,10 +125,19 @@ def make_env(seed: int = SEED) -> Monitor:
       DroneCityEnv  →  Monitor
     Monitor must be the outermost wrapper so SB3 can read episode stats.
     """
-    env = DroneCityEnv(start=START_VOXEL, goal=GOAL_VOXEL)
-    env = Monitor(env)
-    env.reset(seed=seed)
-    return env
+    def _init() -> Monitor:
+        # Offset the start voxel based on rank to prevent UE4 physical collision crashes
+        # e.g., Drone0 at (0, 0, 5), Drone1 at (2, 2, 5), Drone2 at (4, 4, 5)
+        offset_start = (
+            START_VOXEL[0] + rank * 2,
+            START_VOXEL[1] + rank * 2,
+            START_VOXEL[2]
+        )
+        env = DroneCityEnv(start=offset_start, goal=GOAL_VOXEL, rank=rank)
+        env = Monitor(env)
+        env.reset(seed=seed + rank)
+        return env
+    return _init
 
 import torch as th
 import torch.nn as nn
@@ -169,7 +179,7 @@ class DroneCustomExtractor(BaseFeaturesExtractor):
                 extractors[key] = cnn
                 total_concat_size += cnn_out_dim
                 
-            elif key in ["kinematics", "waypoint_vector"]:
+            elif key in ["kinematics", "waypoint_vector", "distance_sensor"]:
                 # 2. معالجة الأرقام (السرعة والمسافة) باستخدام Linear Layers
                 linear = nn.Sequential(
                     nn.Linear(subspace.shape[0], 64),
@@ -225,20 +235,28 @@ def main(resume_path: Optional[str] = None) -> None:
         os.makedirs(directory, exist_ok=True)
 
     # -- 3. Training environment ----------------------------------------------
-    train_env = make_env(seed=SEED)
+    num_envs = 3
+    train_env = SubprocVecEnv([make_env(i, seed=SEED) for i in range(num_envs)])
 
     # -- 4. Evaluation environment (separate instance — never used for training)
     # EvalCallback needs its own env so evaluation episodes don't corrupt
     # the training rollout buffer.
-    eval_env = make_env(seed=SEED + 1)
+    # Removed eval_env to prevent AirSim multi-instance sync crashes.
+    # eval_env = DummyVecEnv([make_env(num_envs, seed=SEED + 1)])
 
     # -- 5. Build or load PPO model ------------------------------------------
     if resume_path:
         logger.info("Resuming training from checkpoint: %s", resume_path)
+        from stable_baselines3.common.utils import get_schedule_fn
+        custom_objects = {
+            "lr_schedule": get_schedule_fn(LEARNING_RATE),
+            "clip_range": get_schedule_fn(CLIP_RANGE),
+        }
         model = PPO.load(
             resume_path,
             env=train_env,
-            device="auto",        # respects CUDA if available
+            device="cuda",        # respects CUDA if available
+            custom_objects=custom_objects
             # Do NOT reset timestep counter so TensorBoard continues the curve
         )
     else:
@@ -272,7 +290,7 @@ def main(resume_path: Optional[str] = None) -> None:
             tensorboard_log  = LOG_DIR,
             verbose          = 1,
             seed             = SEED,
-            device           = "auto",        # auto: uses CUDA if available
+            device           = "cuda",        # auto: uses CUDA if available
         )
 
     logger.info("Model policy:\n%s", model.policy)
@@ -289,18 +307,10 @@ def main(resume_path: Optional[str] = None) -> None:
 
     # 6b. Evaluate periodically and save the BEST model separately.
     #     This is the model you should deploy — not necessarily the final one.
-    eval_cb = EvalCallback(
-        eval_env            = eval_env,
-        best_model_save_path = EVAL_DIR,
-        log_path            = LOG_DIR,
-        eval_freq           = EVAL_FREQ,
-        n_eval_episodes     = N_EVAL_EPS,
-        deterministic       = True,   # greedy policy for evaluation
-        render              = False,
-        verbose             = 1,
-    )
+    # Disabled EvalCallback to prevent AirSim multi-instance sync crashes.
+    # eval_cb = EvalCallback( ... )
 
-    callbacks = CallbackList([checkpoint_cb, eval_cb])
+    callbacks = CallbackList([checkpoint_cb])
 
     # -- 7. Training ----------------------------------------------------------
     try:
@@ -325,7 +335,7 @@ def main(resume_path: Optional[str] = None) -> None:
         logger.info("Saving final model to: %s", FINAL_PATH)
         model.save(FINAL_PATH)
         train_env.close()
-        eval_env.close()
+        # eval_env.close()
         logger.info("Training session ended. Model saved.")
 
 

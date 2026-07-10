@@ -31,7 +31,8 @@ def _mp_detect_frame(payload: tuple) -> List[Dict[str, Any]]:
         return []
     frame_bytes, shape, dtype_str, min_conf = payload
     frame = np.frombuffer(frame_bytes, dtype=np.dtype(dtype_str)).copy().reshape(shape)
-    results = _process_model(frame, verbose=False, device=_process_device)
+    # Added augment=True and imgsz=640 to make the existing model predictions much stronger
+    results = _process_model(frame, verbose=False, device=_process_device, augment=True, imgsz=640)
     detections: List[Dict[str, Any]] = []
     for result in results:
         names = result.names
@@ -79,7 +80,7 @@ class VisionService:
         camera_id: str = "0",
         min_confidence: float = 0.5,
         max_workers: int = 2,
-        device: str = "cpu",
+        device: str = "puc",
         airsim_ip: str = "127.0.0.1",
         airsim_port: int = 41451,
     ):
@@ -87,6 +88,7 @@ class VisionService:
         self.project_root = project_root
         self.camera_id = camera_id
         self.min_confidence = min_confidence
+        self.max_workers = max_workers
         self.device = device
         self.airsim_ip = airsim_ip
         self.airsim_port = airsim_port
@@ -147,19 +149,24 @@ class VisionService:
 
     def _fetch_frame_sync(self, client, camera_id: str):
         import airsim
-        # Request both RGB and Segmentation
+        # Request RGB, Segmentation, and DepthPlanar
         responses = client.simGetImages([
             airsim.ImageRequest(camera_id, airsim.ImageType.Scene, False, False),
-            airsim.ImageRequest(camera_id, airsim.ImageType.Segmentation, False, False)
+            airsim.ImageRequest(camera_id, airsim.ImageType.Segmentation, False, False),
+            airsim.ImageRequest(camera_id, airsim.ImageType.DepthPlanar, True, False)
         ])
         
-        results = {"rgb": np.array([]), "seg": np.array([])}
+        results = {"rgb": np.array([]), "seg": np.array([]), "depth": np.array([])}
         
         for resp in responses:
             if resp.image_type == airsim.ImageType.Scene:
                 results["rgb"] = self._process_response(resp)
             elif resp.image_type == airsim.ImageType.Segmentation:
                 results["seg"] = self._process_response(resp)
+            elif resp.image_type == airsim.ImageType.DepthPlanar:
+                if resp.width > 0 and resp.height > 0:
+                    depth_raw = np.array(resp.image_data_float, dtype=np.float32).reshape(resp.height, resp.width)
+                    results["depth"] = depth_raw
                 
         return results
 
@@ -250,13 +257,40 @@ class VisionService:
         try:
             payload = (frame.tobytes(), frame.shape, frame.dtype.str, self.min_confidence)
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(self._infer_executor, _mp_detect_frame, payload)
+            future = loop.run_in_executor(self._infer_executor, _mp_detect_frame, payload)
+            
+            # Strict timeout to prevent Windows multiprocessing deadlock 
+            return await asyncio.wait_for(future, timeout=0.15)
+            
+        except asyncio.TimeoutError:
+            self.logger.error("🚨 YOLO inference timed out! Worker deadlocked. Assuming clear path for this frame.")
+            # Restart the deadlocked pool in the background
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, self._restart_inference_pool)
+            return []
         except asyncio.CancelledError:
             self.logger.warning("detect_objects cancelled.")
             raise
         except Exception as exc:
             self.logger.error("Detection failed: %s", exc)
             return []
+
+    def _restart_inference_pool(self):
+        """Flushes dead workers and creates a fresh ProcessPoolExecutor."""
+        self.logger.warning("♻️ Flushing and restarting VisionService inference pool...")
+        try:
+            self._infer_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        
+        mp_context = mp.get_context("spawn")
+        self._infer_executor = ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            mp_context=mp_context,
+            initializer=_init_vision_worker,
+            initargs=(str(self.weights_path), self.device),
+        )
+        self.logger.info("✅ Inference pool restarted successfully.")
 
     async def save_detected_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> None:
         """Non-blocking JPEG encode + disk write with Drone Awareness info."""

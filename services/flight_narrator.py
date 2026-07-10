@@ -40,7 +40,7 @@ class FlightNarrator:
     # ====================================================================
     def narrate(
         self,
-        action: str,
+        action: Any,
         pose: Dict[str, float],
         velocity: Dict[str, float],
         target: Dict[str, float],
@@ -75,7 +75,7 @@ class FlightNarrator:
 
         step_prefix = f"[Step {step}] " if step is not None else ""
         self.logger.info(
-            "\n%s🗣️ Action: %s\nReason: %s\nStatus: %s",
+            "\n" + "-" * 60 + "\n%s🗣️ Action: %s\nReason: %s\nStatus: %s",
             step_prefix, action_text, reason_text, status_text,
         )
 
@@ -86,29 +86,20 @@ class FlightNarrator:
     # ====================================================================
 
     # ── action line ─────────────────────────────────────────────────────
-    def _describe_action(self, action: str, obstacle_ahead: bool) -> str:
+    def _describe_action(self, action: Any, obstacle_ahead: bool) -> str:
         if obstacle_ahead:
-            if action in ("turn_left", "turn_right"):
-                direction = "left" if action == "turn_left" else "right"
-                return f"Rotating {direction} — obstacle avoidance engaged"
-            if action == "up":
-                return "Ascending — obstacle avoidance engaged"
-            return "Holding position — evaluating obstacle field"
+            return "Obstacle in view — applying continuous velocity adjustments"
 
-        labels = {
-            "forward":    "Moving forward at approach speed",
-            "turn_left":  "Rotating left (yaw −20°)",
-            "turn_right":  "Rotating right (yaw +20°)",
-            "up":         "Ascending to better altitude",
-            "down":       "Descending to better altitude",
-            "hover":      "Hovering in place",
-        }
-        return labels.get(action, f"Executing '{action}' maneuver")
+        try:
+            vx, vy, vz = float(action[0]), float(action[1]), float(action[2])
+            return f"Executing continuous velocities: vx={vx:.1f}, vy={vy:.1f}, vz={vz:.1f}"
+        except:
+            return f"Executing maneuver {action}"
 
     # ── reason line ─────────────────────────────────────────────────────
     def _describe_reason(
         self,
-        action: str,
+        action: Any,
         obstacle_ahead: bool,
         obstacle_class: str,
         obstacle_label: str,
@@ -121,44 +112,30 @@ class FlightNarrator:
             conf = closest.get("confidence", 0) * 100
             bbox = closest.get("bbox", [0, 0, 0, 0])
             width = bbox[2] - bbox[0]
-            risk_label = {
-                "person":    "HIGH RISK",
-                "vehicle":   "MEDIUM RISK",
-                "structure": "LOW RISK",
-            }
+            height = bbox[3] - bbox[1]
+            area = width * height
+            
+            # Assume standard AirSim resolution 640x480 (307,200 pixels)
+            area_ratio = area / 307200.0
+            
+            if area_ratio >= 0.20:
+                risk_level = "HIGH RISK"
+            elif area_ratio >= 0.05:
+                risk_level = "MEDIUM RISK"
+            else:
+                risk_level = "LOW RISK"
+                
             return (
-                f'"{obstacle_label}" ({risk_label.get(obstacle_class, "UNKNOWN")}) '
+                f'"{obstacle_label}" ({risk_level}) '
                 f"detected ahead with {conf:.0f}% confidence "
-                f"(bbox width {width:.0f}px). "
-                f"PathPlanner triggered {obstacle_class}-specific avoidance."
+                f"(bbox area {area_ratio*100:.1f}%). "
+                f"PPO agent adjusting velocities for avoidance."
             )
 
-        if action == "forward":
-            return (
-                f"No obstacles in the forward field of view. "
-                f"RL agent selected 'forward' — clear path toward target "
-                f"{dist_to_target:.1f}m to the {bearing}."
-            )
-        if action == "turn_left":
-            return (
-                f"RL agent chose to rotate left to align heading "
-                f"with target {dist_to_target:.1f}m to the {bearing}."
-            )
-        if action == "turn_right":
-            return (
-                f"RL agent chose to rotate right to align heading "
-                f"with target {dist_to_target:.1f}m to the {bearing}."
-            )
-        if action in ("up", "down"):
-            verb = "ascend" if action == "up" else "descend"
-            return (
-                f"RL agent chose to {verb} for better altitude positioning. "
-                f"Target is {dist_to_target:.1f}m to the {bearing}."
-            )
-        # hover
         return (
-            f"RL agent chose to hold position. "
-            f"Target is {dist_to_target:.1f}m to the {bearing}."
+            f"No critical obstacles in the forward field of view. "
+            f"PPO agent selected continuous velocity vector to progress toward target "
+            f"{dist_to_target:.1f}m to the {bearing}."
         )
 
     # ── status line ─────────────────────────────────────────────────────

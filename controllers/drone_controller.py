@@ -53,9 +53,9 @@ class DroneController:
             # Fix: Hold altitude strictly when not intentionally moving up/down
             state = client.getMultirotorState()
             z = state.kinematics_estimated.position.z_val
-            client.moveByVelocityZAsync(vx, vy, z, duration, airsim.DrivetrainType.MaxDegreeOfFreedom, airsim.YawMode(True, 0.0)).join()
+            client.moveByVelocityZAsync(vx, vy, z, duration, airsim.DrivetrainType.MaxDegreeOfFreedom, airsim.YawMode(True, 0.0))
         else:
-            client.moveByVelocityAsync(vx, vy, vz, duration).join()
+            client.moveByVelocityAsync(vx, vy, vz, duration)
 
     def _ascend_sync(self, client, z, velocity):
         client.moveToZAsync(z, velocity).join()
@@ -96,7 +96,10 @@ class DroneController:
         client.enableApiControl(False)
 
     def _reset_sync(self, client):
-        client.reset()
+        # client.reset() # DEPRECATED: Causes FMallocBinned2 crashes in UE4
+        import airsim
+        start_pose = airsim.Pose(airsim.Vector3r(0, 0, -5), airsim.to_quaternion(0, 0, 0))
+        client.simSetVehiclePose(start_pose, True)
         client.enableApiControl(True)
         client.armDisarm(True)
 
