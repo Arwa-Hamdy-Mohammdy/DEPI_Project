@@ -13,7 +13,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 from controllers.drone_controller import DroneController
-from intelligence.path_planner import PathPlanner
+from intelligence.PathPlanner import PathPlanner
 from intelligence.rl_agent import RLAgent
 from services.vision_service import VisionService
 from services.flight_narrator import FlightNarrator
@@ -40,7 +40,8 @@ async def run_control_loop(
 
     vision = VisionService(project_root=project_root, logger=logger, device='cuda', min_confidence=0.35)
     controller = DroneController(logger=logger)
-    planner = PathPlanner(logger=logger)
+    dummy_grid = np.zeros((10, 10, 10), dtype=np.uint8)
+    planner = PathPlanner(voxel_grid=dummy_grid)
     narrator = FlightNarrator(logger=logger)
     
     # [1] Load the trained PPO model
@@ -169,6 +170,10 @@ async def _run_goal_mission(
     MAX_STEPS = int(600.0 / delay)  # Max 10 minutes timeout fail-safe
     step_count = 0
     reached_target = False
+    
+    # State machine for persistent lateral evasion
+    evasion_direction = 1.0
+    is_evading = False
 
     while not reached_target and step_count < MAX_STEPS:
         frames, current_pose, current_yaw = await asyncio.gather(
@@ -201,12 +206,19 @@ async def _run_goal_mission(
         emergency_state = False
         final_vx, final_vy, final_vz = 0.0, 0.0, 0.0
         
-        # 1. Evasive Ascent (Imminent Collision < 2.4 meters)
+        # 1. Evasive Ascent & Wall-Sliding (Imminent Collision < 2.4 meters)
         if dist_val < 0.08:
-            logger.warning("🚨 PANIC OVERRIDE ENGAGED: Imminent collision detected! Forcing evasive ascent.")
-            final_vx, final_vy, final_vz = 0.0, 0.0, 1.5  # Ascend in ENU (+Z = Up)
+            if not is_evading:
+                # Determine lateral direction based on PPO's underlying preference
+                action, _ = agent.predict(state, deterministic=True)
+                evasion_direction = 1.0 if float(action[1]) >= 0 else -1.0
+                is_evading = True
+                
+            logger.warning("🚨 PANIC OVERRIDE ENGAGED: Imminent collision! Forcing lateral wall-slide.")
+            final_vx, final_vy, final_vz = 0.0, 2.0 * evasion_direction, 0.5  # Slide laterally, slight climb
             emergency_state = True
         else:
+            is_evading = False
             # Only query PPO if not in an emergency
             action, _ = agent.predict(state, deterministic=True)
             final_vx, final_vy, final_vz = float(action[0]), float(action[1]), float(action[2])
@@ -368,6 +380,9 @@ def _build_consistent_state(
     seg_raw = frames.get("seg", np.zeros((H, W, 3), dtype=np.uint8))
     if depth_raw.size == 0:
         depth_raw = np.zeros((H, W), dtype=np.float32)
+        
+    # Clean NaNs and Infs from depth map to prevent PPO from outputting NaNs (which causes UE to despawn the drone)
+    depth_raw = np.nan_to_num(depth_raw, nan=MAX_DEPTH_M, posinf=MAX_DEPTH_M, neginf=0.0)
         
     # 3.5 Center Distance Sensor (Matches DroneCityEnv implementation)
     ph, pw = depth_raw.shape

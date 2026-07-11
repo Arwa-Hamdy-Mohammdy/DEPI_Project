@@ -3,58 +3,86 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing as mp
+import queue
 import numpy as np
 import cv2
 from typing import Any, List, Dict
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor  
+from concurrent.futures import ThreadPoolExecutor
 
 # =============================================================================
-# Multiprocessing Worker Globals (CPU-heavy YOLO)
+# Multiprocessing Worker (Persistent Producer-Consumer)
 # =============================================================================
-_process_model = None
-_process_weights_path = None
-_process_device = None
-
-def _init_vision_worker(weights_path: str, device: str):
-    global _process_model, _process_weights_path, _process_device
-    _process_weights_path = weights_path
-    _process_device = device
+def _yolo_worker_loop(
+    input_queue: mp.Queue, 
+    output_queue: mp.Queue, 
+    weights_path: str, 
+    device: str, 
+    min_confidence: float
+):
+    """
+    Persistent background worker that loads YOLO once and runs continuously.
+    It reads frames from the input queue, runs inference, and writes results 
+    to the output queue.
+    """
     from ultralytics import YOLO
-    _process_model = YOLO(weights_path)
-    _process_model.predict(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False, device=device)
+    import traceback
+    
+    try:
+        model = YOLO(weights_path)
+        # Warmup
+        model.predict(np.zeros((480, 640, 3), dtype=np.uint8), verbose=False, device=device)
+    except Exception as e:
+        print(f"YOLO Worker failed to initialize: {e}")
+        return
 
-def _mp_detect_frame(payload: tuple) -> List[Dict[str, Any]]:
-    global _process_model, _process_device
-    if _process_model is None:
-        return []
-    frame_bytes, shape, dtype_str, min_conf = payload
-    frame = np.frombuffer(frame_bytes, dtype=np.dtype(dtype_str)).copy().reshape(shape)
-    # Added augment=True and imgsz=640 to make the existing model predictions much stronger
-    results = _process_model(frame, verbose=False, device=_process_device, augment=True, imgsz=640)
-    detections: List[Dict[str, Any]] = []
-    for result in results:
-        names = result.names
-        for box in result.boxes:
-            conf = float(box.conf.item())
-            if conf < min_conf:
-                continue
-            cls_id = int(box.cls.item())
-            coords = box.xyxy[0].tolist()
-            detections.append({
-                "label": names.get(cls_id, str(cls_id)),
-                "confidence": conf,
-                "bbox": coords,
-            })
-    return detections
+    while True:
+        try:
+            # Block until a frame is available
+            payload = input_queue.get()
+            if payload is None:  # Poison pill for graceful shutdown
+                break
+                
+            frame_bytes, shape, dtype_str = payload
+            frame = np.frombuffer(frame_bytes, dtype=np.dtype(dtype_str)).copy().reshape(shape)
+            
+            # Inference
+            results = model(frame, verbose=False, device=device, augment=True, imgsz=640)
+            
+            detections: List[Dict[str, Any]] = []
+            for result in results:
+                names = result.names
+                for box in result.boxes:
+                    conf = float(box.conf.item())
+                    if conf < min_confidence:
+                        continue
+                    cls_id = int(box.cls.item())
+                    coords = box.xyxy[0].tolist()
+                    detections.append({
+                        "label": names.get(cls_id, str(cls_id)),
+                        "confidence": conf,
+                        "bbox": coords,
+                    })
+                    
+            # Push to output queue. 
+            # We drain the output queue first to prevent memory bloat and ensure only the absolute freshest frame is read by the main loop.
+            while not output_queue.empty():
+                try: output_queue.get_nowait()
+                except queue.Empty: break
+                
+            output_queue.put(detections)
+            
+        except Exception as e:
+            print(f"YOLO Worker encountered an error during inference: {traceback.format_exc()}")
+            continue
 
 
 # =============================================================================
 # Async Vision Service
 # =============================================================================
 class VisionService:
-    """Owns a private AirSim camera thread + a process pool for YOLO."""
+    """Owns a private AirSim camera thread + a persistent YOLO process."""
 
     # AirSim Segmentation ID Mapping
     SEG_CLASS_MAPPING = {
@@ -79,8 +107,8 @@ class VisionService:
         model_filename: str = "best.pt",
         camera_id: str = "0",
         min_confidence: float = 0.5,
-        max_workers: int = 2,
-        device: str = "puc",
+        max_workers: int = 1, # Unused now, keeping for interface compatibility
+        device: str = "cuda",
         airsim_ip: str = "127.0.0.1",
         airsim_port: int = 41451,
     ):
@@ -88,7 +116,6 @@ class VisionService:
         self.project_root = project_root
         self.camera_id = camera_id
         self.min_confidence = min_confidence
-        self.max_workers = max_workers
         self.device = device
         self.airsim_ip = airsim_ip
         self.airsim_port = airsim_port
@@ -117,17 +144,28 @@ class VisionService:
         self._airsim_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airsim_cam")
         self._airsim_client = None
 
-        # Process pool for CPU-heavy YOLO (bypasses Python GIL)
+        # Persistent Process Setup (Producer-Consumer pattern)
         mp_context = mp.get_context("spawn")
-        self._infer_executor = ProcessPoolExecutor(
-            max_workers=max_workers,
-            mp_context=mp_context,
-            initializer=_init_vision_worker,
-            initargs=(str(self.weights_path), device),
+        self.input_queue = mp_context.Queue(maxsize=2)
+        self.output_queue = mp_context.Queue(maxsize=2)
+        self.latest_yolo_detections: List[Dict[str, Any]] = []
+        
+        self.worker_process = mp_context.Process(
+            target=_yolo_worker_loop,
+            args=(
+                self.input_queue, 
+                self.output_queue, 
+                str(self.weights_path), 
+                self.device, 
+                self.min_confidence
+            ),
+            daemon=True # Ensures the process exits when the main script crashes
         )
+        self.worker_process.start()
+        
         self.logger.info(
-            "VisionService ready | camera thread: 1 | inference pool: %s workers | device: %s",
-            max_workers, device,
+            "VisionService ready | camera thread: 1 | persistent YOLO process: 1 | device: %s",
+            device,
         )
 
     # -------------------------------------------------------------------------
@@ -234,16 +272,35 @@ class VisionService:
         return detections
 
     async def get_fused_detections(self, rgb_frame: np.ndarray, seg_frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Merge YOLO detections with Segmentation-based detections."""
-        # 1. Get YOLO detections (Targets/Dynamic objects)
-        yolo_dets = await self.detect_objects(rgb_frame)
-        for d in yolo_dets: d["source"] = "yolo"
+        """Merge YOLO detections with Segmentation-based detections in a non-blocking way."""
+        # 1. Producer: Send latest RGB frame to the YOLO worker if it is ready
+        if rgb_frame.size > 0:
+            try:
+                payload = (rgb_frame.tobytes(), rgb_frame.shape, rgb_frame.dtype.str)
+                self.input_queue.put_nowait(payload)
+            except queue.Full:
+                pass # YOLO is still processing, drop frame (don't block the control loop)
+
+        # 2. Consumer: Drain output queue to fetch the absolute freshest YOLO detection
+        new_dets = None
+        while not self.output_queue.empty():
+            try:
+                new_dets = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
         
-        # 2. Get Segmentation detections (Structures/Environment)
+        if new_dets is not None:
+            self.latest_yolo_detections = new_dets
+
+        # 3. Process fast Segmentation logic (runs on main thread, ~1-3ms)
         seg_dets = self._extract_seg_objects(seg_frame)
         
-        # 3. Fuse
-        return yolo_dets + seg_dets
+        # 4. Fuse the latest known YOLO state with the real-time Segmentation state
+        yolo_dets_copy = list(self.latest_yolo_detections)
+        for d in yolo_dets_copy: 
+            d["source"] = "yolo"
+            
+        return yolo_dets_copy + seg_dets
 
     async def get_frame(self) -> np.ndarray:
         """Legacy support: returns only RGB frame."""
@@ -251,46 +308,16 @@ class VisionService:
         return frames["rgb"]
 
     async def detect_objects(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Offload YOLO to process pool."""
-        if frame.size == 0:
-            return []
-        try:
-            payload = (frame.tobytes(), frame.shape, frame.dtype.str, self.min_confidence)
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(self._infer_executor, _mp_detect_frame, payload)
-            
-            # Strict timeout to prevent Windows multiprocessing deadlock 
-            return await asyncio.wait_for(future, timeout=0.15)
-            
-        except asyncio.TimeoutError:
-            self.logger.error("🚨 YOLO inference timed out! Worker deadlocked. Assuming clear path for this frame.")
-            # Restart the deadlocked pool in the background
-            loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, self._restart_inference_pool)
-            return []
-        except asyncio.CancelledError:
-            self.logger.warning("detect_objects cancelled.")
-            raise
-        except Exception as exc:
-            self.logger.error("Detection failed: %s", exc)
-            return []
-
-    def _restart_inference_pool(self):
-        """Flushes dead workers and creates a fresh ProcessPoolExecutor."""
-        self.logger.warning("♻️ Flushing and restarting VisionService inference pool...")
-        try:
-            self._infer_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        
-        mp_context = mp.get_context("spawn")
-        self._infer_executor = ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=mp_context,
-            initializer=_init_vision_worker,
-            initargs=(str(self.weights_path), self.device),
-        )
-        self.logger.info("✅ Inference pool restarted successfully.")
+        """Legacy compatibility method. Defers to the persistent worker and returns latest."""
+        if frame.size > 0:
+            try:
+                payload = (frame.tobytes(), frame.shape, frame.dtype.str)
+                self.input_queue.put_nowait(payload)
+            except queue.Full:
+                pass
+                
+        # Immediately return the cached result without blocking
+        return list(self.latest_yolo_detections)
 
     async def save_detected_frame(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> None:
         """Non-blocking JPEG encode + disk write with Drone Awareness info."""
@@ -339,9 +366,19 @@ class VisionService:
         self.logger.debug("Saved detection log: %s", file_path)
 
     def shutdown(self):
-        self._infer_executor.shutdown(wait=True)
+        """Gracefully shut down the persistent worker and thread pool."""
+        self.logger.info("Initiating VisionService shutdown...")
+        try:
+            self.input_queue.put_nowait(None) # Poison pill
+        except queue.Full:
+            pass
+            
+        self.worker_process.join(timeout=2.0)
+        if self.worker_process.is_alive():
+            self.worker_process.terminate()
+            
         self._airsim_executor.shutdown(wait=True)
-        self.logger.info("VisionService shut down.")
+        self.logger.info("VisionService shut down successfully.")
 
     async def save_frame(self,frame:np.array) -> None:
             if frame.size == 0:

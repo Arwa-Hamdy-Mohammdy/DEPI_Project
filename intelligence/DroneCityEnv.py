@@ -385,7 +385,7 @@ class DroneCityEnv(gym.Env):
         
         self._step_count += 1
         obs       = self._get_obs(state)
-        reward, terminated = self._compute_reward(action, state)
+        reward, terminated = self._compute_reward(action, state, obs)
         truncated = self._step_count >= self._max_episode_steps
 
         if terminated or truncated:
@@ -503,6 +503,9 @@ class DroneCityEnv(gym.Env):
             depth_response.image_data_float, dtype=np.float32
         ).reshape(depth_response.height, depth_response.width)
 
+        # Clean NaNs and Infs from depth map to prevent PPO from outputting NaNs
+        depth_raw = np.nan_to_num(depth_raw, nan=MAX_DEPTH_M, posinf=MAX_DEPTH_M, neginf=0.0)
+
         # ── Resize to network input size ──────────────────────────────────
         if depth_raw.shape != (DEPTH_IMG_H, DEPTH_IMG_W):
             depth_raw = self._resize_depth(depth_raw, DEPTH_IMG_H, DEPTH_IMG_W)
@@ -546,6 +549,7 @@ class DroneCityEnv(gym.Env):
         self,
         action: np.ndarray,
         state: airsim.MultirotorState,
+        obs: Dict[str, np.ndarray],
     ) -> Tuple[float, bool]:
         """Compute the scalar reward for the current step.
 
@@ -609,6 +613,19 @@ class DroneCityEnv(gym.Env):
         # ── 3. Time penalty (dense) ───────────────────────────────────────
         reward += TIME_PENALTY
 
+        # ── 3.5. Altitude & Evasion Policies ──────────────────────────────
+        # Excessive Ascent Penalty
+        if pos_z > 15.0:
+            reward -= 0.5  # Strong penalty for flying too high
+
+        # Stuck / Lateral Evasion Reward
+        dist_val = float(obs["distance_sensor"][0])
+        if dist_val < 0.1:  # Assuming 0.1 is a safe triggering distance (e.g., 4 meters)
+            if abs(action[1]) > 0.6:  # Changed from 1.0 to 0.6 to fall within valid action bounds
+                reward += 0.5  # Positive reinforcement for dodging laterally
+            elif action[0] < 0.5:
+                reward -= 1.0  # Penalty for getting stuck without sidestepping
+                
         # ── 4. Smoothness penalty (dense) ─────────────────────────────────
         action_delta  = np.linalg.norm(action - self._prev_action)
         reward       += SMOOTH_PENALTY * action_delta

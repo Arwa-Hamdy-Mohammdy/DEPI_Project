@@ -56,7 +56,7 @@ GOAL_VOXEL   = (40, 40, 5)
 SEED         = 42           # fixed seed for reproducibility
 
 # -- PPO core --
-TOTAL_TIMESTEPS = 2_000_000  # 500k is too low for 3-D drone navigation
+TOTAL_TIMESTEPS = 500_000  # 500k is too low for 3-D drone navigation
 N_STEPS      = 2048    # rollout length per environment update
 BATCH_SIZE   = 256     # minibatch size (2048/256 = 8 minibatches per epoch)
 N_EPOCHS     = 10      # gradient passes over each rollout buffer
@@ -235,7 +235,7 @@ def main(resume_path: Optional[str] = None) -> None:
         os.makedirs(directory, exist_ok=True)
 
     # -- 3. Training environment ----------------------------------------------
-    num_envs = 3
+    num_envs = 5
     train_env = SubprocVecEnv([make_env(i, seed=SEED) for i in range(num_envs)])
 
     # -- 4. Evaluation environment (separate instance — never used for training)
@@ -350,7 +350,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume",
         type=str,
-        default=None,
+        default="./models/checkpoints/ppo_drone_330000_steps.zip",
         metavar="CHECKPOINT_PATH",
         help="Path to a .zip checkpoint to resume training from.",
     )

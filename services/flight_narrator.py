@@ -4,8 +4,22 @@ import math
 import logging
 from typing import Any, Dict, List, Optional
 
-from intelligence.rl_agent import classify_detection
+OBJECT_RISK_CATEGORIES: Dict[str, str] = {
+    "person": "person", "pedestrian": "person", "child": "person",
+    "worker": "person", "cyclist": "person",
+    "car": "vehicle", "truck": "vehicle", "bus": "vehicle",
+    "motorcycle": "vehicle", "bicycle": "vehicle", "van": "vehicle",
+    "boat": "vehicle", "train": "vehicle",
+    "building": "structure", "house": "structure", "wall": "structure",
+    "fence": "structure", "bridge": "structure", "tower": "structure",
+    "pole": "structure", "traffic light": "structure", "stop sign": "structure",
+    "fire hydrant": "structure", "bench": "structure", "tree": "structure",
+}
+DEFAULT_RISK_CATEGORY = "structure"
 
+def classify_detection(label: str) -> str:
+    """Map a YOLO label to a risk category: 'person', 'vehicle', or 'structure'."""
+    return OBJECT_RISK_CATEGORIES.get(label.lower().strip(), DEFAULT_RISK_CATEGORY)
 
 class FlightNarrator:
     """
